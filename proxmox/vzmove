@@ -1,0 +1,351 @@
+#!/bin/bash 
+# Copyright (C) 2000-2010, Parallels, Inc. All rights reserved.
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+#
+#
+# vzmove is used for container migration to another storage in unique node
+#
+# TODO: - Tester présence du stockage dans la conf du proxmox
+# - Tester que la destination diff source
+# - Afficher l'avancement
+#
+
+ACT_SCRIPTS_SFX="start stop mount umount premount postumount"
+RSYNC_OPTIONS="-aH --delete --numeric-ids"
+VZCTL=vzctl
+
+verbose=0
+remove_area=1
+keep_dst=0
+debug=0
+confdir="/etc/vz/conf"
+vzconf="/etc/vz/vz.conf"
+tmpdir="/var/tmp"
+act_scripts=
+
+# Errors:
+MIG_ERR_USAGE=1
+MIG_ERR_VPS_IS_STOPPED=2
+MIG_ERR_CANT_CONNECT=4
+MIG_ERR_COPY=6
+MIG_ERR_START_VPS=7
+MIG_ERR_STOP_SOURCE=8
+MIG_ERR_EXISTS=9
+MIG_ERR_NOEXIST=10
+MIG_ERR_IP_IN_USE=12
+MIG_ERR_QUOTA=13
+MIG_ERR_CHECKPOINT=$MIG_ERR_STOP_SOURCE
+MIG_ERR_MOUNT_VPS=$MIG_ERR_START_VPS
+MIG_ERR_RESTORE_VPS=$MIG_ERR_START_VPS
+MIG_ERR_OVZ_NOT_RUNNING=14
+MIG_ERR_APPLY_CONFIG=15
+
+# For local vzctl to work, make sure /usr/sbin is in $PATH
+if ! echo ":${PATH}:" | fgrep -q ':/usr/sbin:'; then
+	PATH="/usr/sbin:$PATH"
+fi
+
+usage() {
+	cat >&2 <<EOF
+This program is used for container migration to another storage in uniq node.
+Usage:
+vzmove destination_address <CTID>
+Example:
+	Migration of CT #102 to foo.com with downtime:
+		vzmove /var/lib/vz 102
+EOF
+	exit $MIG_ERR_USAGE
+}
+
+# Logs message
+# There are 3 types of messages:
+# 0 - error messages (print to stderr)
+# 1 - normal messages (print to stdout)
+# 2 - debug messages (print to stdout if in verbose mode)
+log () {
+	if [ $1 -eq 0 ]; then
+		shift
+		echo "Error: $*" >&2
+	elif [ $1 -eq 1 ]; then
+		shift
+		echo "$*"
+	elif [ $verbose -gt 0 ]; then
+		shift
+		echo "   $@"
+	fi
+}
+
+# Executes command and returns result of execution
+# There are 2 types of execution:
+# 1 - normal execution (all output will be printed)
+# 2 - debug execution (output will be printed if verbose mode is set,
+#     in other case stdout and stderr redirected to /dev/null)
+logexec () {
+	if [ $1 -eq 1 -o $verbose -gt 0 ]; then
+		shift
+		$@
+	else
+		shift
+		$@ >/dev/null 2>&1
+	fi
+}
+
+undo_conf () {
+	echo "$VZCTL set $VEID --name '' --save > /dev/null"
+	echo "rm -f $vpsconf"
+}
+
+undo_act_scripts () {
+	if [ -n "$act_scripts" ] ; then
+		echo "rm -f $act_scripts"
+	fi
+	undo_conf
+}
+
+undo_private () {
+	if [ $keep_dst -eq 0 ]; then
+ 		echo "rm -rf $VE_PRIVATE"
+	fi
+	undo_act_scripts
+}
+
+undo_root () {
+	undo_private
+}
+
+undo_quota_init () {
+	[ "${DISK_QUOTA}" = 'no' ] || echo "vzquota drop $VEID"
+	undo_root
+}
+
+undo_quota_on () {
+	[ "${DISK_QUOTA}" = 'no' ] || echo "vzquota off $VEID"
+	undo_quota_init
+}
+
+undo_sync () {
+	# Root will be destroyed in undo_root
+	undo_quota_on
+}
+
+undo_suspend () {
+	logexec 2 $VZCTL chkpnt $VEID --resume
+	undo_sync
+}
+
+undo_dump () {
+	if [ $debug -eq 0 ]; then
+		echo rm -f "$VE_DUMPFILE"
+	fi
+	undo_suspend
+}
+
+undo_copy_dump () {
+	echo "rm -f $VE_DUMPFILE"
+	undo_suspend
+}
+
+undo_stop () {
+	if [ "$state" = "running" ]; then
+		$VZCTL start $VEID
+	elif [ "$mounted" = "mounted" ]; then
+		$VZCTL mount $VEID
+	fi
+	undo_sync
+}
+
+undo_source_stage() {
+		undo_stop
+}
+
+undo_quota_dump () {
+	echo rm -f "$VE_QUOTADUMP"
+	undo_source_stage
+}
+
+undo_copy_quota () {
+	echo "rm -f $VE_QUOTADUMP"
+	undo_quota_dump
+}
+
+undo_undump () {
+	logexec 2 $VZCTL restore $VEID --kill
+	undo_copy_quota
+}
+
+get_status() {
+	exist=$3
+	mounted=$4
+	state=$5
+}
+
+get_time () {
+	awk -v t2=$2 -v t1=$1 'BEGIN{print t2-t1}'
+}
+
+if [ $# -lt 2 ]; then
+	usage
+fi
+
+while [ ! -z "$1" ]; do
+	case "$1" in
+	-v)
+		verbose=$((verbose+1)) # can just be 'let verbose++' in bash
+		;;
+	-vv)
+		verbose=$((verbose+2))
+		;;
+	-vvv)
+		verbose=$((verbose+3))
+		;;
+	--remove-area|-r)
+		shift
+		if [ "$1" = "yes" ]; then
+			remove_area=1
+		elif [ "$1" = "no" ]; then
+			remove_area=0
+		else
+			usage
+		fi
+		;;
+	--keep-dst)
+		keep_dst=1
+		;;
+	--rsync=*)
+		RSYNC_OPTIONS="$RSYNC_OPTIONS $(echo $1 | cut -c9-)"
+		;;
+	*)
+		break
+		;;
+	esac
+	shift
+done
+
+if [ $verbose -gt 1 ]; then
+	RSYNC_OPTIONS="$RSYNC_OPTIONS -v"
+	VZCTL="$VZCTL --verbose"
+fi
+
+RSYNC="rsync $RSYNC_OPTIONS"
+
+storage_dest=$1
+shift
+VEID=$1
+shift
+
+NEW_VE_PRIVATE="$storage_dest/private/$VEID"
+
+if [ -z "$NEW_VE_PRIVATE" -o -z "$VEID" -o $# -ne 0 ]; then
+	usage
+fi
+
+# Support CT names as well
+if echo $VEID | egrep -qv '^[[:digit:]]+$'; then
+	VEID=$(vzlist -o ctid -H $VEID | tr -d ' ')
+	if [ -z "$VEID" ]; then
+		# Error message is printed by vzlist to stderr
+		exit $MIG_ERR_NOEXIST
+	fi
+fi
+
+vpsconf="$confdir/$VEID.conf"
+
+if [ ! -r "$vzconf" ]; then
+	log 0 "Can't read global config file $vzconf"
+	exit $MIG_ERR_NOEXIST
+fi
+
+get_status $($VZCTL status $VEID)
+if [ "$exist" = "deleted" ]; then
+	log 0 "CT #$VEID doesn't exist"
+	exit $MIG_ERR_NOEXIST
+fi
+
+log 1 "Starting migration of CT $VEID to $NEW_VE_PRIVATE"
+
+log 2 "Loading $vzconf and $vpsconf files"
+
+. "$vzconf"
+. "$vpsconf"
+VE_DUMPFILE="$tmpdir/dump.$VEID"
+VE_QUOTADUMP="$tmpdir/quotadump.$VEID"
+
+
+log 2 "Creating new container private dir"
+mkdir -p $NEW_VE_PRIVATE
+
+log 1 "Syncing private"
+$RSYNC --sparse "$VE_PRIVATE" "${NEW_VE_PRIVATE%/*}"
+# Ignore rsync error 24 "Partial transfer due to vanished source files"
+if [ $? != 24 ] && [ $? != 0 ]; then
+	log 0 "Failed to sync container private areas"
+	undo_quota_on
+	exit $MIG_ERR_COPY
+fi
+
+if [ "$state" = "running" ]; then
+		log 1 "Stopping container"
+		if ! logexec 2 $VZCTL stop $VEID ; then
+			log 0 "Failed to stop container"
+			undo_sync
+			exit $MIG_ERR_STOP_SOURCE
+		fi
+elif [ "$mounted" = "mounted" ]; then
+		log 1 "Unmounting container"
+		if ! logexec 2 $VZCTL umount $VEID ; then
+			log 0 "Failed to umount container"
+			undo_sync
+			exit $MIG_ERR_STOP_SOURCE
+		fi
+fi
+
+log 2 "Change storage in config file"
+cp $vpsconf $vpsconf.migrate
+sed -i -e "s|^VE_PRIVATE=.*$|VE_PRIVATE=\"$storage_dest/private/\$VEID\"|" $vpsconf 2>/dev/null 
+vzquota drop $VEID
+
+if [ "$state" = "running" ]; then
+	log 2 "Syncing private (2nd pass)"
+	time_rsync2=$(date +%s.%N)
+	if ! $RSYNC "$VE_PRIVATE" "${NEW_VE_PRIVATE%/*}"; then
+		log 0 "Failed to sync container private areas"
+		undo_source_stage
+		exit $MIG_ERR_COPY
+	fi
+fi
+
+if [ "$state" = "running" ]; then
+		log 1 "Starting container"
+		if ! logexec 2 $VZCTL start $VEID ; then
+			log 0 "Failed to start container"
+			undo_copy_quota
+			exit $MIG_ERR_START_VPS
+		fi
+elif [ "$mounted" = "mounted" ]; then
+		log 1 "Mounting container"
+		if ! logexec 2 $VZCTL mount $VEID ; then
+			log 0 "Failed to mount container"
+			undo_copy_quota
+			exit $MIG_ERR_MOUNT_VPS
+		fi
+fi
+
+log 1 "Cleanup"
+
+if [ $remove_area -eq 1 ]; then
+	log 2 "Destroying old private area container"
+	#logexec 2 $VZCTL destroy $VEID
+fi
